@@ -1,13 +1,20 @@
 package com.dataclip.piggyweb;
 
+import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import javax.servlet.http.HttpServletResponse;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.hdfs.DFSClient;
 import org.apache.pig.ExecType;
 import org.apache.pig.PigServer;
 import org.apache.pig.backend.executionengine.ExecException;
@@ -19,6 +26,7 @@ import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.client.RestTemplate;
 
 @Controller
 public class JobsController implements Lifecycle {
@@ -27,8 +35,38 @@ public class JobsController implements Lifecycle {
 	
 	private final ExecutorService threadPool = Executors.newFixedThreadPool(3);
 	
+	@RequestMapping(value="/results")
+	public String jobResults(HttpServletResponse response, @RequestParam String path) {
+		response.setCharacterEncoding("utf-8");
+		response.setContentType("text/plain");
+		try {
+			DFSClient dfsClient = new DFSClient(new Configuration(true));
+			
+			if ( !dfsClient.exists(path) ) {
+				response.setStatus(404);
+				return null;
+			}
+			
+			FileStatus status = dfsClient.getFileInfo(path);
+			response.setContentLength((int)status.getLen());
+			
+			BufferedInputStream in = new BufferedInputStream(dfsClient.open(path));
+			OutputStream os = response.getOutputStream();
+			
+			byte[] buf = new byte[4096];
+			while ( in.read(buf) > 0 ) {
+				os.write(buf);
+			}
+			response.setStatus(200);
+		} catch (IOException e) {
+			response.setStatus(500);
+			LOG.error("Unable to read from HDFS: " + e.getMessage(), e);
+		}
+		return null;
+	}
+	
 	@RequestMapping(value="/jobs", method=RequestMethod.PUT)
-	public void newJob(@RequestParam String script) {
+	public void newJob(@RequestParam String script, @RequestParam final String callbackUrl) {
 		
 		final String tmpFile;
 		try {
@@ -42,9 +80,15 @@ public class JobsController implements Lifecycle {
 			public void run() {
 				LOG.info("Submitting script to pig server...");
 				List<ExecJob> jobs = submitJobs(tmpFile);
-		        LOG.info("Submitted batch of " + jobs.size() + " jobs. Waiting for completion...");
+		        
+				LOG.info("Submitted batch of " + jobs.size() + " jobs. Waiting for completion...");
 		        waitForCompletion(jobs);
+		        
 		        LOG.info("All jobs complete. Check task tracker for more info.");
+		        RestTemplate restClient = new RestTemplate();
+		        
+		        //ping the app and let it know the job is done
+		        restClient.postForLocation(callbackUrl, null);
 			}
 		});
 		LOG.info("Job submitted successfully.");
