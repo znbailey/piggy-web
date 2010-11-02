@@ -37,32 +37,59 @@ public class JobsController implements Lifecycle {
 	
 	@RequestMapping(value="/results")
 	public String jobResults(HttpServletResponse response, @RequestParam String path) {
+		LOG.info("Got request for results in path: " + path);
 		response.setCharacterEncoding("utf-8");
 		response.setContentType("text/plain");
 		try {
 			DFSClient dfsClient = new DFSClient(new Configuration(true));
 			
 			if ( !dfsClient.exists(path) ) {
+				LOG.error("Results path " + path + " does not exist. Returning 404.");
 				response.setStatus(404);
 				return null;
 			}
 			
+			OutputStream out = response.getOutputStream();
+			
 			FileStatus status = dfsClient.getFileInfo(path);
-			response.setContentLength((int)status.getLen());
-			
-			BufferedInputStream in = new BufferedInputStream(dfsClient.open(path));
-			OutputStream os = response.getOutputStream();
-			
-			byte[] buf = new byte[4096];
-			while ( in.read(buf) > 0 ) {
-				os.write(buf);
-			}
+			if ( status.isDir() ) {
+				FileStatus[] files = dfsClient.listPaths(path);
+				LOG.info("Results path " + path + " is directory. Contains " + files.length + " children.");
+				long totalSize = 0L;
+				for ( FileStatus file : files ) {					
+					if ( !file.isDir() ) {
+						totalSize += file.getLen();
+					}
+				}
+				response.setContentLength((int)totalSize);
+				for ( FileStatus file : files ) {					
+					if ( !file.isDir() ) {
+						LOG.info("Streaming individual file " + file.getPath().toString() + " out of results path " + path);
+						streamFile(file.getPath().toString(), dfsClient, out);
+					}
+				}
+			} else {
+				LOG.info("Results path " + path + " is single file. Streaming...");
+				response.setContentLength((int)status.getLen());
+				streamFile(path, dfsClient, out);
+			}			
 			response.setStatus(200);
 		} catch (IOException e) {
 			response.setStatus(500);
 			LOG.error("Unable to read from HDFS: " + e.getMessage(), e);
 		}
+		LOG.info("Done serving results at path " + path);
 		return null;
+	}
+
+	private void streamFile(String path, DFSClient dfsClient, OutputStream out)
+			throws IOException {
+		
+		BufferedInputStream in = new BufferedInputStream(dfsClient.open(path));
+		byte[] buf = new byte[4096];
+		while ( in.read(buf) > 0 ) {
+			out.write(buf);
+		}
 	}
 	
 	@RequestMapping(value="/jobs", method=RequestMethod.PUT)
@@ -78,17 +105,21 @@ public class JobsController implements Lifecycle {
 		
 		threadPool.submit(new Runnable() {
 			public void run() {
-				LOG.info("Submitting script to pig server...");
-				List<ExecJob> jobs = submitJobs(tmpFile);
-		        
-				LOG.info("Submitted batch of " + jobs.size() + " jobs. Waiting for completion...");
-		        waitForCompletion(jobs);
-		        
-		        LOG.info("All jobs complete. Check task tracker for more info.");
-		        RestTemplate restClient = new RestTemplate();
-		        
-		        //ping the app and let it know the job is done
-		        restClient.postForLocation(callbackUrl, null);
+				try {
+					LOG.info("Submitting script to pig server...");
+					List<ExecJob> jobs = submitJobs(tmpFile);
+			        
+					LOG.info("Submitted batch of " + jobs.size() + " jobs. Waiting for completion...");
+			        waitForCompletion(jobs);
+			        
+			        LOG.info("All jobs complete. Check task tracker for more info.");
+			        RestTemplate restClient = new RestTemplate();
+			        
+			        //ping the app and let it know the job is done
+			        restClient.getForObject(callbackUrl, Response.class);
+				} catch ( Throwable t ) {
+					LOG.error("Error running pig script: " + t.getMessage(), t);
+				}
 			}
 		});
 		LOG.info("Job submitted successfully.");
@@ -179,6 +210,12 @@ public class JobsController implements Lifecycle {
 		} catch ( InterruptedException ie ) {
 			return;
 		}
+	}
+	
+	static class Response {
+		boolean success;
+		public boolean isSuccess() { return success; }
+		public void setSuccess(boolean success) { this.success = success; }				
 	}
 	
 }
